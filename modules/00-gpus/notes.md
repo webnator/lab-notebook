@@ -106,18 +106,107 @@ folding it into a magic number, because that factor is what went wrong once alre
 
 ## The 7B arithmetic
 
-Using the **measured** 207 GB/s, not the spec.
+All of it on the **measured** 207 GB/s, not the spec.
 
-- Weights at fp16: 7e9 params x 2 bytes = 14 GB
-- Time for one full read of the weights: TODO
-- Ceiling in tokens/s at batch size 1: TODO
-- Memory-bound or compute-bound, and by what margin: TODO
-- Batch size at which we stop being memory-bound: TODO
+### One full read of the weights
 
-Reading weights is read-only. The 2x traffic factor from the copy benchmark does **not** carry
-over here — verify before using the number.
+```
+7e9 params x 2 bytes (fp16)  =  14 GB
+14 GB / 207 GB/s             =  67.6 ms
+```
+
+Reading weights is read-only, so the 2x traffic factor from the copy benchmark does not carry
+over. That factor existed because a copy writes back what it reads; a forward pass does not write
+the weights anywhere.
+
+### Ceiling in tokens/s at batch size 1
+
+Producing one token requires reading every weight once, so the ceiling is the inverse of the read:
+
+```
+1 / 0.0676 s  =  14.8 tokens/s
+```
+
+Theoretical, with the hardware perfectly saturated. Slow enough to watch arrive word by word.
+
+### Memory-bound or compute-bound
+
+Arithmetic per token is ~2 FLOPs per parameter: `2 x 7e9 = 14 GFLOP`.
+
+Card figure used: **30.0 TFLOP/s, Tensor Core**. Deliberately not the other two on the datasheet —
+12.0 TFLOP/s FP32 is the CUDA cores, which LLM inference does not run on, and 24.0 TFLOP/s RT is
+ray-triangle intersection hardware, unrelated to any of this. The datasheet did not state whether
+the 30.0 is dense or assumes structured sparsity; if it is the sparse figure the dense one is half
+that, and the ridge point below halves with it.
+
+```
+1.4e10 FLOP / 3.0e13 FLOP/s  =  0.47 ms of compute
+67.6 ms of memory / 0.47 ms of compute  =  145x
+```
+
+**Memory-bound by 145x.** The tensor cores are idle about 99.3% of the time, waiting for weights
+to arrive over the bus.
+
+First pass at this gave 0.47 as 0.047 — one order of magnitude out, from dividing 14 by 30 and
+placing the exponent afterwards instead of normalising to 1.4e10 / 3.0e13 first. The qualitative
+conclusion survived either way, which is exactly why the slip went unnoticed. What caught it was
+the next number refusing to agree.
+
+### Batch size at which we stop being memory-bound
+
+```
+ridge point = 3.0e13 FLOP/s / 2.07e11 B/s = 145 FLOPs per byte
+```
+
+At batch size B the arithmetic intensity is ~B FLOPs/byte, so the ridge is reached around
+**batch 145**.
+
+### Why those two numbers are the same
+
+The 145x margin and the batch-145 ridge point are not a coincidence and not two measurements.
+They are the same quantity:
+
+```
+margin  =  t_memory / t_compute  =  (W / BW) / (2P / F)
+
+    W = 2P              fp16: 2 bytes per parameter
+    FLOPs per token = 2P    2 FLOPs per parameter
+
+        =  (2P / BW) / (2P / F)  =  F / BW      <- the definition of the ridge point
+```
+
+The `2P` cancels. It cancels because in fp16 every parameter contributes 2 bytes to read and
+2 FLOPs to do, which puts the arithmetic intensity at exactly **1 FLOP per byte** at batch size 1.
+When intensity is 1, the ratio of the two times is just the ratio of the machine's two capacities.
+
+Two things fall out of that:
+
+**The 7B never mattered.** It cancelled out. A 70B in fp16 on this same card gives the same 145 —
+ten times slower in absolute terms, equally memory-bound, same ridge point. 145 is a property of
+the hardware, not of the model.
+
+**And it only holds in fp16.** In int8 the bytes halve but the FLOPs do not, so intensity becomes
+2 FLOPs/byte and the ridge arrives at batch ~72. That is the less-told half of quantization: it
+speeds up generation *and* moves you toward the compute-bound regime sooner.
 
 ## What this changes
 
-TODO — batching, quantization, prefill vs. generation, and what 14 GB of weights on a 16 GB card
-means for the KV cache.
+**Batching.** Read the weights once, serve 32 sequences. Same bytes moved, 32x the output tokens,
+intensity up 32x. On this card there is headroom all the way to batch ~145 before the tensor cores
+become the constraint — every batch slot below that is close to free throughput.
+
+**Quantization is not optional here, it is the entry ticket.** 14 GB of fp16 weights on a card
+with 15.96 GB usable leaves under 2 GB. A 7B-shaped model (32 layers, hidden 4096, no GQA — worth
+verifying against a specific model) needs `2 (K and V) x 32 x 4096 x 2 bytes` per token, about
+512 KB. Two spare gigabytes buy roughly **4,000 tokens of context**, and that is before activations
+or fragmentation. The weights fit; there is barely room left to think. int8 halves the weights and
+buys back most of the context window.
+
+**Prefill and generation are opposite regimes on the same hardware.** Prefill pushes many tokens
+through one read of the weights, so its intensity scales with prompt length and it lands
+compute-bound. Generation is one token per full read of the weights: intensity 1, memory-bound by
+145x. Same model, same card, two different machines depending on which phase you are in.
+
+**And the practical one.** The measured 207 GB/s, not the 224 on the datasheet, is what these
+numbers rest on. The gap is small here; the habit is not. Every estimate above is only as good as
+the number it was built from, which is why the module measures rather than quotes.
