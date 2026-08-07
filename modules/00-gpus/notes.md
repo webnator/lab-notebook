@@ -7,7 +7,7 @@
 | GPU | NVIDIA RTX 2000 Ada Generation |
 | VRAM | 15957 MiB usable (16380 MiB reported by `nvidia-smi`) |
 | SMs | 22 |
-| Bandwidth, spec | 224 GB/s |
+| Bandwidth, spec | 224 GB/s (NVIDIA datasheet, checked) |
 | Bandwidth, measured | **207 GB/s** — 92% of spec |
 
 Host: RunPod, EU-RO-1, image `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`.
@@ -133,11 +133,11 @@ Theoretical, with the hardware perfectly saturated. Slow enough to watch arrive 
 
 Arithmetic per token is ~2 FLOPs per parameter: `2 x 7e9 = 14 GFLOP`.
 
-Card figure used: **30.0 TFLOP/s, Tensor Core**. Deliberately not the other two on the datasheet —
-12.0 TFLOP/s FP32 is the CUDA cores, which LLM inference does not run on, and 24.0 TFLOP/s RT is
-ray-triangle intersection hardware, unrelated to any of this. The datasheet did not state whether
-the 30.0 is dense or assumes structured sparsity; if it is the sparse figure the dense one is half
-that, and the ridge point below halves with it.
+Card figure used: **30.0 TFLOP/s, Tensor Core**, taken as the dense number. Deliberately not the
+other two on the datasheet — 12.0 TFLOP/s FP32 is the CUDA cores, which LLM inference does not run
+on, and 24.0 TFLOP/s RT is ray-triangle intersection hardware, unrelated to any of this. The sheet
+does not label the 30.0 as dense explicitly; if it turns out to be the structured-sparsity figure,
+the dense one is half and the ridge point below halves with it.
 
 ```
 1.4e10 FLOP / 3.0e13 FLOP/s  =  0.47 ms of compute
@@ -196,9 +196,9 @@ intensity up 32x. On this card there is headroom all the way to batch ~145 befor
 become the constraint — every batch slot below that is close to free throughput.
 
 **Quantization is not optional here, it is the entry ticket.** 14 GB of fp16 weights on a card
-with 15.96 GB usable leaves under 2 GB. A 7B-shaped model (32 layers, hidden 4096, no GQA — worth
-verifying against a specific model) needs `2 (K and V) x 32 x 4096 x 2 bytes` per token, about
-512 KB. Two spare gigabytes buy roughly **4,000 tokens of context**, and that is before activations
+with 15.96 GB usable leaves under 2 GB. Assuming Llama-2-7B geometry — 32 layers, hidden 4096, no GQA, not
+verified against a specific checkpoint — the KV cache costs
+`2 (K and V) x 32 x 4096 x 2 bytes` per token, about 512 KB. Two spare gigabytes buy roughly **4,000 tokens of context**, and that is before activations
 or fragmentation. The weights fit; there is barely room left to think. int8 halves the weights and
 buys back most of the context window.
 
